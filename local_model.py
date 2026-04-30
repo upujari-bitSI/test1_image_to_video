@@ -155,11 +155,14 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
         pipe.enable_model_cpu_offload()
 
     pipe.unet.enable_forward_chunking()
-    try:
-        pipe.vae.enable_slicing()
-        pipe.vae.enable_tiling()
-    except AttributeError:
-        pass
+    for fn_name in ("enable_slicing", "enable_tiling"):
+        fn = getattr(pipe.vae, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+        except (NotImplementedError, AttributeError):
+            pass  # SVD's AutoencoderKLTemporalDecoder doesn't support these
 
     _pipe = pipe
     return pipe
