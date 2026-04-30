@@ -10,9 +10,8 @@ from __future__ import annotations
 import gc
 import os
 import tempfile
-from pathlib import Path
-
 import time
+from pathlib import Path
 
 import torch
 from PIL import Image
@@ -21,11 +20,14 @@ from diffusers.utils import export_to_video
 
 MODEL_ID = "stabilityai/stable-video-diffusion-img2vid-xt"
 
-# Allow overriding via env (e.g. HF_ENDPOINT=https://hf-mirror.com for users
-# behind unreliable networks).
-_HF_ENDPOINT = os.environ.get("HF_ENDPOINT")
-if _HF_ENDPOINT:
-    os.environ["HF_ENDPOINT"] = _HF_ENDPOINT
+# Mirrors tried in order when the primary HuggingFace endpoint is unreachable.
+# hf-mirror.com is a well-known community mirror that is often accessible when
+# huggingface.co itself is blocked (common in China and some other regions).
+_HF_MIRRORS = [
+    os.environ.get("HF_ENDPOINT", ""),   # user override first
+    "https://huggingface.co",            # official
+    "https://hf-mirror.com",             # community mirror
+]
 
 _pipe: StableVideoDiffusionPipeline | None = None
 
@@ -33,49 +35,87 @@ _pipe: StableVideoDiffusionPipeline | None = None
 def _vram_gb() -> float:
     if not torch.cuda.is_available():
         return 0.0
-    props = torch.cuda.get_device_properties(0)
-    return props.total_memory / (1024 ** 3)
+    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+
+def _try_snapshot(model_id: str, ignore: list[str], endpoint: str) -> str | None:
+    """Attempt snapshot_download against one HF endpoint. Returns path or None."""
+    from huggingface_hub import snapshot_download
+
+    env_backup = os.environ.get("HF_ENDPOINT")
+    if endpoint:
+        os.environ["HF_ENDPOINT"] = endpoint
+    elif "HF_ENDPOINT" in os.environ:
+        del os.environ["HF_ENDPOINT"]
+
+    try:
+        return snapshot_download(
+            model_id,
+            ignore_patterns=ignore,
+            resume_download=True,
+            max_workers=2,
+        )
+    except Exception as exc:
+        print(f"[i2v] endpoint {endpoint or 'default'} failed: {type(exc).__name__}: {exc}")
+        return None
+    finally:
+        if env_backup is not None:
+            os.environ["HF_ENDPOINT"] = env_backup
+        elif "HF_ENDPOINT" in os.environ:
+            del os.environ["HF_ENDPOINT"]
+
+
+def _try_local_cache(model_id: str, variant: str | None) -> str | None:
+    """Return a cached local snapshot path if one already exists, else None."""
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(
+            model_id,
+            ignore_patterns=[],
+            local_files_only=True,
+        )
+    except Exception:
+        return None
 
 
 def _prefetch_weights(variant: str | None) -> str:
-    """Download the model snapshot with resume + retries.
+    """Download model weights, trying mirrors on failure.
 
-    Returns the local snapshot path. Lets us survive flaky connections that
-    drop large file transfers (the WinError 10054 case on Windows).
+    Strategy (in order):
+    1. User-set HF_ENDPOINT (if any)
+    2. Official huggingface.co  (up to 3 retries)
+    3. hf-mirror.com community mirror
+    4. Already-cached local snapshot (useful when network is fully down)
     """
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.utils import (
-        HfHubHTTPError,
-        LocalEntryNotFoundError,
-    )
+    ignore = ["*.bin", "*.fp32.safetensors"] if variant == "fp16" else ["*.fp16.safetensors"]
 
-    # Skip the *other* precision's weights to halve the download size.
-    if variant == "fp16":
-        ignore = ["*.bin", "*.fp32.safetensors"]
-    else:
-        ignore = ["*.fp16.safetensors"]
+    endpoints = [ep for ep in _HF_MIRRORS if ep]  # drop empty strings
 
-    last_err: Exception | None = None
-    for attempt in range(1, 6):
-        try:
-            return snapshot_download(
-                MODEL_ID,
-                ignore_patterns=ignore,
-                resume_download=True,
-                max_workers=2,  # fewer parallel streams = fewer drops
-            )
-        except (HfHubHTTPError, OSError, ConnectionError) as e:
-            last_err = e
-            wait = min(2 ** attempt, 30)
-            print(f"[i2v] download attempt {attempt} failed ({e!r}); retrying in {wait}s")
-            time.sleep(wait)
-        except LocalEntryNotFoundError as e:
-            last_err = e
-            break
+    for endpoint in endpoints:
+        for attempt in range(1, 4):
+            result = _try_snapshot(MODEL_ID, ignore, endpoint)
+            if result:
+                return result
+            if attempt < 3:
+                wait = 2 ** attempt
+                print(f"[i2v] retrying in {wait}s (attempt {attempt}/3) ...")
+                time.sleep(wait)
+
+    # Last resort: return whatever is in the local cache, even if incomplete.
+    cached = _try_local_cache(MODEL_ID, variant)
+    if cached:
+        print("[i2v] Network unreachable; loading from local cache.")
+        return cached
+
     raise RuntimeError(
-        f"Failed to download {MODEL_ID} after retries. "
-        f"Last error: {last_err}. "
-        "Try again on a more stable network, or set HF_ENDPOINT to a mirror."
+        f"Cannot download {MODEL_ID}: all endpoints unreachable and no local cache found.\n\n"
+        "Options:\n"
+        "  1. Check your internet connection and try again.\n"
+        "  2. Use the mirror explicitly:\n"
+        "       Windows PowerShell: $env:HF_ENDPOINT='https://hf-mirror.com'\n"
+        "       Windows CMD:        set HF_ENDPOINT=https://hf-mirror.com\n"
+        "  3. Download the model manually from https://hf-mirror.com/stabilityai/stable-video-diffusion-img2vid-xt\n"
+        "     and set HF_HUB_CACHE to the parent folder."
     )
 
 
@@ -91,9 +131,7 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
 
     dtype = torch.float16
 
-    # Try fp16 variant first (smaller download, faster on RTX 3060).
-    # If those files weren't fetched (e.g. partial download), fall back to
-    # the default precision and cast the pipeline to fp16 in memory.
+    # Try fp16 variant first; fall back to default precision if unavailable.
     try:
         local_dir = _prefetch_weights(variant="fp16")
         pipe = StableVideoDiffusionPipeline.from_pretrained(
@@ -103,7 +141,7 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
             local_files_only=True,
         )
     except (ValueError, OSError) as e:
-        print(f"[i2v] fp16 variant unavailable ({e}); falling back to default weights")
+        print(f"[i2v] fp16 variant unavailable ({e}); using default weights")
         local_dir = _prefetch_weights(variant=None)
         pipe = StableVideoDiffusionPipeline.from_pretrained(
             local_dir,
@@ -111,12 +149,9 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
             local_files_only=True,
         )
 
-    vram = _vram_gb()
-    if vram < 10:
-        # 8GB cards: trade speed for memory
+    if _vram_gb() < 10:
         pipe.enable_sequential_cpu_offload()
     else:
-        # RTX 3060 12GB: model offload is faster and still fits
         pipe.enable_model_cpu_offload()
 
     pipe.unet.enable_forward_chunking()
@@ -131,7 +166,6 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
 
 
 def unload() -> None:
-    """Free GPU memory by dropping the cached pipeline."""
     global _pipe
     _pipe = None
     gc.collect()
@@ -141,7 +175,6 @@ def unload() -> None:
 
 def _prepare_image(image: Image.Image, width: int, height: int) -> Image.Image:
     image = image.convert("RGB")
-    # Center-crop to target aspect, then resize
     target_ratio = width / height
     src_w, src_h = image.size
     src_ratio = src_w / src_h
@@ -168,13 +201,11 @@ def generate_video(
     height: int = 576,
     progress_callback=None,
 ) -> str:
-    """Generate a video clip from a single image. Returns path to mp4."""
     if image is None:
         raise ValueError("An input image is required.")
 
     pipe = _load_pipeline()
     img = _prepare_image(image, width, height)
-
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
 
     callback_kwargs = {}
@@ -182,7 +213,6 @@ def generate_video(
         def _cb(pipe_self, step, timestep, kwargs):
             progress_callback(step, num_frames)
             return kwargs
-
         callback_kwargs["callback_on_step_end"] = _cb
 
     result = pipe(

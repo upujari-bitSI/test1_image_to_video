@@ -79,7 +79,7 @@ def unload_local():
     return "Local model unloaded."
 
 
-with gr.Blocks(title="Image to Video Generator", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Image to Video Generator") as demo:
     gr.Markdown(
         "# Image to Video Generator\n"
         "Pick **Local** for free offline generation on your RTX 3060, "
@@ -169,4 +169,5 @@ if __name__ == "__main__":
         server_name=os.environ.get("HOST", "127.0.0.1"),
         server_port=int(os.environ.get("PORT", "7860")),
         share=os.environ.get("GRADIO_SHARE", "0") == "1",
+        theme=gr.themes.Soft(),
     )
