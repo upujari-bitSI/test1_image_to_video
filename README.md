@@ -61,6 +61,25 @@ cp .env.example .env
 
 Pricing is pay-per-run (Wan 2.5 480p/5s is roughly $0.25).
 
+## Troubleshooting downloads (Windows / flaky networks)
+
+The first run pulls ~9 GB from HuggingFace. If you see
+`WinError 10054 ... connection forcibly closed` or
+`variant=fp16 ... no such modeling files`:
+
+1. Just re-run - downloads now resume from where they stopped.
+2. Speed up + stabilize:
+   ```bash
+   pip install hf_transfer
+   set HF_HUB_ENABLE_HF_TRANSFER=1     # PowerShell: $env:HF_HUB_ENABLE_HF_TRANSFER="1"
+   ```
+3. If your ISP throttles HuggingFace, use a mirror:
+   ```bash
+   set HF_ENDPOINT=https://hf-mirror.com
+   ```
+4. As a last resort, delete the partial cache and retry:
+   `%USERPROFILE%\.cache\huggingface\hub\models--stabilityai--stable-video-diffusion-img2vid-xt`
+
 ## Tips
 
 - If you hit CUDA OOM on the local tab, switch resolution to 768x432 or lower

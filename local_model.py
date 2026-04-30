@@ -12,12 +12,20 @@ import os
 import tempfile
 from pathlib import Path
 
+import time
+
 import torch
 from PIL import Image
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import export_to_video
 
 MODEL_ID = "stabilityai/stable-video-diffusion-img2vid-xt"
+
+# Allow overriding via env (e.g. HF_ENDPOINT=https://hf-mirror.com for users
+# behind unreliable networks).
+_HF_ENDPOINT = os.environ.get("HF_ENDPOINT")
+if _HF_ENDPOINT:
+    os.environ["HF_ENDPOINT"] = _HF_ENDPOINT
 
 _pipe: StableVideoDiffusionPipeline | None = None
 
@@ -27,6 +35,48 @@ def _vram_gb() -> float:
         return 0.0
     props = torch.cuda.get_device_properties(0)
     return props.total_memory / (1024 ** 3)
+
+
+def _prefetch_weights(variant: str | None) -> str:
+    """Download the model snapshot with resume + retries.
+
+    Returns the local snapshot path. Lets us survive flaky connections that
+    drop large file transfers (the WinError 10054 case on Windows).
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import (
+        HfHubHTTPError,
+        LocalEntryNotFoundError,
+    )
+
+    # Skip the *other* precision's weights to halve the download size.
+    if variant == "fp16":
+        ignore = ["*.bin", "*.fp32.safetensors"]
+    else:
+        ignore = ["*.fp16.safetensors"]
+
+    last_err: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            return snapshot_download(
+                MODEL_ID,
+                ignore_patterns=ignore,
+                resume_download=True,
+                max_workers=2,  # fewer parallel streams = fewer drops
+            )
+        except (HfHubHTTPError, OSError, ConnectionError) as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            print(f"[i2v] download attempt {attempt} failed ({e!r}); retrying in {wait}s")
+            time.sleep(wait)
+        except LocalEntryNotFoundError as e:
+            last_err = e
+            break
+    raise RuntimeError(
+        f"Failed to download {MODEL_ID} after retries. "
+        f"Last error: {last_err}. "
+        "Try again on a more stable network, or set HF_ENDPOINT to a mirror."
+    )
 
 
 def _load_pipeline() -> StableVideoDiffusionPipeline:
@@ -40,11 +90,26 @@ def _load_pipeline() -> StableVideoDiffusionPipeline:
         )
 
     dtype = torch.float16
-    pipe = StableVideoDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        variant="fp16",
-    )
+
+    # Try fp16 variant first (smaller download, faster on RTX 3060).
+    # If those files weren't fetched (e.g. partial download), fall back to
+    # the default precision and cast the pipeline to fp16 in memory.
+    try:
+        local_dir = _prefetch_weights(variant="fp16")
+        pipe = StableVideoDiffusionPipeline.from_pretrained(
+            local_dir,
+            torch_dtype=dtype,
+            variant="fp16",
+            local_files_only=True,
+        )
+    except (ValueError, OSError) as e:
+        print(f"[i2v] fp16 variant unavailable ({e}); falling back to default weights")
+        local_dir = _prefetch_weights(variant=None)
+        pipe = StableVideoDiffusionPipeline.from_pretrained(
+            local_dir,
+            torch_dtype=dtype,
+            local_files_only=True,
+        )
 
     vram = _vram_gb()
     if vram < 10:
